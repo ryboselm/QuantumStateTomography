@@ -29,13 +29,16 @@ pyro.set_rng_seed(0)
 the probabilistic model for QST class
 """
 class QuantumStateTomography(nn.Module):
-    def __init__(self, N=3, alpha = 1, K=3, POVM="standard", sigma = 1):
+    def __init__(self, N=3, alpha = 1, K=3, POVM=None, sigma = 1):
         super().__init__()
         #define hyperparameters
         self.N = 2**N        # size of system (2^num qubits)
         self.alpha = alpha   # sparsity of the density matrix
         self.K = K           # rank of the density matrix
-        self.POVM = POVM     # measurement set used
+        if POVM != None:
+            self.POVM = [torch.from_numpy(povm).type(torch.complex64) for povm in POVM]
+        else:
+            self.POVM = None     # measurement set used
         self.sigma = sigma   # variance of the complex vectors
 
     def model(self, data):
@@ -47,7 +50,7 @@ class QuantumStateTomography(nn.Module):
             norm_vector = complex_vector / torch.norm(complex_vector, dim=-1, keepdim=True)
         theta_diag = torch.diag(theta).type(torch.complex64)
         norm_vector_hat = torch.conj(torch.transpose(norm_vector, 0,1))
-        density_matrix = torch.matmul(torch.matmul(norm_vector_hat, theta_diag), norm_vector)
+        rho = pyro.deterministic("density matrix", torch.matmul(torch.matmul(norm_vector_hat, theta_diag), norm_vector))
         
         ### Alternate way of computing the density matrix
         # density_matrix = torch.zeros((self.N,self.N), dtype=torch.complex64)
@@ -59,17 +62,16 @@ class QuantumStateTomography(nn.Module):
         # print(density_matrix.shape)
         # print(density_matrix)
         #rho = pyro.sample("Density Matrix", dist.Delta(density_matrix, event_dim=2))
-        rho = density_matrix
         #in principle we could apply any POVM measurement set upon this density matrix using traces
 
-        if self.POVM == "standard":
+        if self.POVM == None:
             #standard basis measurements
             with pyro.plate('data', len(data)):
                 return pyro.sample("obs", dist.Categorical(torch.diagonal(rho).real), obs=data)
-        else:
-            #TBD
+        else: #generic POVM case
+            probabilities = torch.Tensor([torch.trace(torch.matmul(povm,rho)).real for povm in self.POVM])
             with pyro.plate('data', len(data)):
-                return pyro.sample("obs", dist.Categorical(torch.diagonal(rho).real), obs=data)
+                return pyro.sample("obs", dist.Categorical(probabilities), obs=data)
             
 """
 trains on the data
@@ -155,17 +157,26 @@ def load_data(path):
     random.shuffle(data)
     return data
 
+def load_povm(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
 """
 Runs the experiment
 """
-def run_tomography_model(name, n_qubits=2, n_states=1, povm="standard", batch_size = 128):
-    countspath = "data/" + name + "_counts"
+def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128):
+    countspath = "data/" + name + "_POVM_counts"
     try:
         data = load_data(countspath)
     except:
         print(f"An exception occurred with loading the data from {name}_counts!")
         return
-
+    povmpath = "data/" + name + "_POVM"
+    try:
+        povm = load_povm(povmpath)
+    except:
+        print("The corresponding POVM could not be found. using standard basis instead.")
+        povm = None
 
     # Run options
     LEARNING_RATE = 1.0e-3
@@ -226,7 +237,7 @@ def run_tomography_model(name, n_qubits=2, n_states=1, povm="standard", batch_si
     real_prob = np.round(np.real(np.diag(true_DM)),3)
     print('approx:',approx_prob)
     print('real:', real_prob)
-    outputpath = "output/"+name+"_results"
+    outputpath = "output/"+name+"_results.txt"
     with open(outputpath, "w") as f:
         f.write(f"name: {name}, num_qubits: {n_qubits}, num_states: {n_states} \n")
         f.write(f"Trace Distance to true Density Matrix: {trace_dist(approx_DM, true_DM).real}\n")

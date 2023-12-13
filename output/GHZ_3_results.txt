@@ -1,0 +1,4 @@
+name: GHZ_3, num_qubits: 3, num_states: 1 
+Trace Distance to true Density Matrix: 0.5507303422009286
+Model Probabilities: [0.695 0.    0.    0.001 0.001 0.001 0.    0.301]
+True Probabilities: [0.5 0.  0.  0.  0.  0.  0.  0.5]
