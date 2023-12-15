@@ -1,8 +1,4 @@
 import numpy as np
-import pandas as pd
-import scipy
-from scipy.sparse import coo_matrix
-import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import random
@@ -32,46 +28,39 @@ class QuantumStateTomography(nn.Module):
     def __init__(self, N=3, alpha = 1, K=3, POVM=None, sigma = 1):
         super().__init__()
         #define hyperparameters
-        self.N = 2**N        # size of system (2^num qubits)
+        self.N = 2**N        # size of system 2^(num qubits)
         self.alpha = alpha   # sparsity of the density matrix
         self.K = K           # rank of the density matrix
-        if POVM != None:
-            self.POVM = [torch.from_numpy(povm).type(torch.complex64) for povm in POVM]
+        if POVM is not None:
+            self.POVM = torch.from_numpy(POVM).type(torch.complex64) # measurement set used
         else:
-            self.POVM = None     # measurement set used
+            self.POVM = None
         self.sigma = sigma   # variance of the complex vectors
 
     def model(self, data):
+        #draw a probability distribution over K pure states
         theta = pyro.sample("theta", dist.Dirichlet(torch.ones(self.K)*self.alpha))
+        
+        #generate K pure states
         with pyro.plate("pure states", self.K):
             real_part = pyro.sample("real_part", dist.MultivariateNormal(torch.zeros(self.N),self.sigma*torch.eye(self.N)))
             imag_part = pyro.sample("imag_part", dist.MultivariateNormal(torch.zeros(self.N),self.sigma*torch.eye(self.N)))
             complex_vector = torch.complex(real_part, imag_part)
             norm_vector = complex_vector / torch.norm(complex_vector, dim=-1, keepdim=True)
-        theta_diag = torch.diag(theta).type(torch.complex64)
-        norm_vector_hat = torch.conj(torch.transpose(norm_vector, 0,1))
-        rho = pyro.deterministic("density matrix", torch.matmul(torch.matmul(norm_vector_hat, theta_diag), norm_vector))
+        norm_vector = torch.transpose(norm_vector,0,1)
         
-        ### Alternate way of computing the density matrix
-        # density_matrix = torch.zeros((self.N,self.N), dtype=torch.complex64)
-        # for i in range(self.K):
-        #     vec = norm_vector[i]
-        #     vec_hat = torch.conj(vec)
-        #     density_matrix += theta[i].type(torch.complex64) * torch.outer(vec,vec_hat)
-        
-        # print(density_matrix.shape)
-        # print(density_matrix)
-        #rho = pyro.sample("Density Matrix", dist.Delta(density_matrix, event_dim=2))
-        #in principle we could apply any POVM measurement set upon this density matrix using traces
-
         if self.POVM == None:
             #standard basis measurements
-            with pyro.plate('data', len(data)):
-                return pyro.sample("obs", dist.Categorical(torch.diagonal(rho).real), obs=data)
-        else: #generic POVM case
-            probabilities = torch.Tensor([torch.trace(torch.matmul(povm,rho)).real for povm in self.POVM])
-            with pyro.plate('data', len(data)):
-                return pyro.sample("obs", dist.Categorical(probabilities), obs=data)
+            squared = torch.conj(norm_vector) * norm_vector
+            probabilities = (squared @ theta.type(torch.complex64))
+            with pyro.plate("data", len(data)):
+                return pyro.sample("obs", dist.Categorical(probabilities.real), obs=data)
+        else:
+            inner_prods = torch.matmul(torch.conj(self.POVM), norm_vector)
+            squared = torch.conj(inner_prods) * inner_prods
+            probabilities = (squared @ theta.type(torch.complex64))
+            with pyro.plate("data", len(data)):
+                return pyro.sample("obs", dist.Categorical(probabilities.real), obs=data)
             
 """
 trains on the data
@@ -137,24 +126,27 @@ def trace_dist(a, b):
     k = a-b
     M = np.matmul(k.conj().T,k)
     B = sqrtm(M)
-    return np.trace(B)/2
+    return np.trace(B).real/2
+"""
+calculates fidelity between two density matrices
+"""
+def fidelity(a,b):
+    k = sqrtm(a)
+    M = k @ b @ k
+    return (np.trace(sqrtm(M)).real)**2
 
 """
 loads data
 """
-def load_data(path):
-    outcomes = {}
+def load_data(path, n_samples=10000):
+    probabilities = []
     with open(path, "r") as f:
         lines = f.read().splitlines()
     for line in lines:
-        outcome, freq = line.split(" ")
-        number = int(outcome)
-        outcomes[number] = int(freq)
-    #creates a shuffled list of the measurement results in proportion
-    data = []
-    for outcome in outcomes:
-        data += [outcome]*outcomes[outcome]
-    random.shuffle(data)
+        _, freq = line.split(" ")
+        probabilities.append(float(freq))
+    options = range(len(probabilities))
+    data = np.random.choice(options, n_samples, p=probabilities)
     return data
 
 def load_povm(path):
@@ -164,19 +156,22 @@ def load_povm(path):
 """
 Runs the experiment
 """
-def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128):
-    countspath = "data/" + name + "_POVM_counts"
-    try:
-        data = load_data(countspath)
-    except:
-        print(f"An exception occurred with loading the data from {name}_counts!")
-        return
+def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128, n_samples=10000):
     povmpath = "data/" + name + "_POVM"
+    povmsize = 2**n_qubits
     try:
         povm = load_povm(povmpath)
+        povmsize = povm.shape[0]
     except:
-        print("The corresponding POVM could not be found. using standard basis instead.")
+        print("The POVM could not be found. using standard basis instead.")
         povm = None
+
+    statspath = "data/" + name + "_statistics"
+    try:
+        data = load_data(statspath, n_samples)
+    except:
+        print(f"An exception occurred with loading the data from {statspath}!")
+        return
 
     # Run options
     LEARNING_RATE = 1.0e-3
@@ -223,35 +218,38 @@ def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128):
 
     real_part = pyro.param('AutoNormal.locs.real_part').data[0]
     imag_part = pyro.param('AutoNormal.locs.imag_part').data[0]
-    #print("norm", torch.norm(torch.complex(real_part, imag_part)))
-    vec = torch.complex(real_part, imag_part) / torch.norm(torch.complex(real_part, imag_part))
-    approx_DM = torch.outer(vec, torch.conj(vec)).numpy()
+ 
+    vec = torch.complex(real_part, imag_part) / torch.linalg.vector_norm(torch.complex(real_part, imag_part))
+    vec = vec.numpy().flatten()
+    approx_DM = np.outer(vec, np.conj(vec))
 
     densitypath = "data/" + name + "_density"
     with open(densitypath, "rb") as file:
         rho = pickle.load(file)
     true_DM = rho.data
-
+    print(name)
     print('Trace Distance:',trace_dist(approx_DM, true_DM).real)
+    print('Fidelity:', fidelity(approx_DM, true_DM).real)
     approx_prob = np.round(np.real(np.diag(approx_DM)),3)
     real_prob = np.round(np.real(np.diag(true_DM)),3)
-    print('approx:',approx_prob)
-    print('real:', real_prob)
+    #print('approx:',approx_prob)
+    #print('real:', real_prob)
     outputpath = "output/"+name+"_results.txt"
     with open(outputpath, "w") as f:
-        f.write(f"name: {name}, num_qubits: {n_qubits}, num_states: {n_states} \n")
-        f.write(f"Trace Distance to true Density Matrix: {trace_dist(approx_DM, true_DM).real}\n")
+        f.write(f"name: {name}, num_qubits: {n_qubits}, num_states: {n_states}, POVM size: {povmsize}, batchsize: {batch_size}, epochs: {NUM_EPOCHS}, Learning Rate: {LEARNING_RATE} \n")
+        f.write(f"Trace Distance to true Density Matrix: {trace_dist(approx_DM, true_DM)}\n")
+        f.write(f"Fidelity to true Density Matrix {fidelity(approx_DM, true_DM)}\n")
         f.write(f"Model Probabilities: {approx_prob}\n")
         f.write(f"True Probabilities: {real_prob}\n")
+        f.write("\n")
 
 
 
 """
 How to run this:
-1. activate conda environment such that all of the libraries are loaded (Pyro, Pytorch, Scipy, etc.)
-2. make sure that the desired counts and density data are present inside the ./data folder. These are generated by GenerateMeasurements.ipynb
-3. run a command such as `python ./qst.py 5 3 -n "random_5"` where the parameters 5, 3, and "random_5" are changed depending on what experiment you want to perform
-4. it will run in the command line, collect data from the ./data folder and then save the plot and results in the ./output folder
+1. make sure that the desired statistics, POVM, and density data are present inside the ./data folder. These are generated by GenerateMeasurements.ipynb
+2. run a command such as `python ./qst.py 5 3 -n "random_5"` where the parameters 5, 3, and "random_5" are changed depending on what experiment you want to perform
+3. it will run in the command line, collect data from the ./data folder and then save the plot and results in the ./output folder
 """
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -259,5 +257,6 @@ if __name__ == "__main__":
     parser.add_argument('k', type=int, help='rank of density matrix')
     parser.add_argument("--name", "-n", type=str, default = "MISSING", help="Choose name of experiment")
     parser.add_argument("--batchsize", "-b", type=int, default=128, help="batch size of the training")
+    parser.add_argument("--samplenum", "-s", type=int, default=10000, help="how many samples in the dataset")
     args = parser.parse_args()
-    run_tomography_model(args.name, args.n, args.k, batch_size=args.batchsize)
+    run_tomography_model(args.name, args.n, args.k, batch_size=args.batchsize, n_samples=args.samplenum)
