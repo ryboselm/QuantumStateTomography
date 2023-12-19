@@ -8,8 +8,7 @@ import argparse
 import torch
 from torch.distributions import constraints
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from torch.utils.data.sampler import SubsetRandomSampler
+import torch.nn.functional as F
 from scipy.linalg import sqrtm
 
 import pyro
@@ -19,7 +18,7 @@ from pyro.optim import Adam, SGD
 
 assert pyro.__version__.startswith('1.8.6')
 pyro.distributions.enable_validation(False)
-pyro.set_rng_seed(0)
+pyro.set_rng_seed(1)
 
 """
 the probabilistic model for QST class
@@ -38,19 +37,20 @@ class QuantumStateTomography(nn.Module):
         self.sigma = sigma   # variance of the complex vectors
 
     def model(self, data):
-        #draw a probability distribution over K pure states
-        theta = pyro.sample("theta", dist.Dirichlet(torch.ones(self.K)*self.alpha))
-        
-        #generate K pure states
+        # draw a probability distribution over K pure states
+        theta = pyro.sample("theta", dist.Dirichlet(torch.ones(self.K) * self.alpha))
+    
+        # generate K pure states
         with pyro.plate("pure states", self.K):
-            real_part = pyro.sample("real_part", dist.MultivariateNormal(torch.zeros(self.N),self.sigma*torch.eye(self.N)))
-            imag_part = pyro.sample("imag_part", dist.MultivariateNormal(torch.zeros(self.N),self.sigma*torch.eye(self.N)))
+            real_part = pyro.sample("real_part", dist.MultivariateNormal(torch.zeros(self.N), torch.eye(self.N)))
+            imag_part = pyro.sample("imag_part", dist.MultivariateNormal(torch.zeros(self.N), torch.eye(self.N)))
             complex_vector = torch.complex(real_part, imag_part)
             norm_vector = complex_vector / torch.norm(complex_vector, dim=-1, keepdim=True)
         norm_vector = torch.transpose(norm_vector,0,1)
         
-        if self.POVM == None:
-            #standard basis measurements
+        # compute the density matrix (rho)
+        if self.POVM is None:
+            # standard basis measurements
             squared = torch.conj(norm_vector) * norm_vector
             probabilities = (squared @ theta.type(torch.complex64))
             with pyro.plate("data", len(data)):
@@ -61,6 +61,26 @@ class QuantumStateTomography(nn.Module):
             probabilities = (squared @ theta.type(torch.complex64))
             with pyro.plate("data", len(data)):
                 return pyro.sample("obs", dist.Categorical(probabilities.real), obs=data)
+        
+    def guide(self, data):
+        constrained_vector = pyro.param("constrained_vector", torch.ones(self.K) / self.K, constraint=constraints.simplex)
+        theta = pyro.sample("theta", dist.Delta(constrained_vector).to_event(1))
+    
+        with pyro.plate("pure states", self.K):
+            real_mean = pyro.param("real_mean", torch.randn(self.K, self.N))
+            imag_mean = pyro.param("imag_mean", torch.randn(self.K, self.N))
+            sigma_real = pyro.param("sigma_real", 0.1 * torch.ones(self.K, self.N), constraint=constraints.positive)
+            sigma_imag = pyro.param("sigma_imag", 0.1 * torch.ones(self.K, self.N), constraint=constraints.positive)
+            
+            cov_matrix_real = torch.zeros(self.K, self.N, self.N)
+            cov_matrix_imag = torch.zeros(self.K, self.N, self.N)
+            for i in range(self.K):
+                cov_matrix_real[i] = torch.diag(sigma_real[i])
+                cov_matrix_imag[i] = torch.diag(sigma_imag[i])
+    
+            real_part = pyro.sample("real_part", dist.MultivariateNormal(real_mean, covariance_matrix=cov_matrix_real))
+            imag_part = pyro.sample("imag_part", dist.MultivariateNormal(imag_mean, covariance_matrix=cov_matrix_imag))
+
             
 """
 trains on the data
@@ -156,7 +176,7 @@ def load_povm(path):
 """
 Runs the experiment
 """
-def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128, n_samples=10000):
+def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128, n_samples=10000, n_epochs=100, lr=1e-3):
     povmpath = "data/" + name + "_POVM"
     povmsize = 2**n_qubits
     try:
@@ -174,12 +194,12 @@ def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128, n_sampl
         return
 
     # Run options
-    LEARNING_RATE = 1.0e-3
+    LEARNING_RATE = lr
     USE_CUDA = False
     smoke_test = False
 
     # Run only for a single iteration for testing
-    NUM_EPOCHS = 1 if smoke_test else 100
+    NUM_EPOCHS = 1 if smoke_test else n_epochs
     TEST_FREQUENCY = 5
 
     train_loader, test_loader = setup_data_loaders(data,batch_size=batch_size, use_cuda=USE_CUDA)
@@ -188,8 +208,7 @@ def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128, n_sampl
 
     qst = QuantumStateTomography(N=n_qubits, K=n_states, POVM=povm)
     optimizer = Adam({"lr": LEARNING_RATE})
-    guide = pyro.infer.autoguide.AutoNormal(qst.model)
-    svi = SVI(qst.model, guide, optimizer, loss=Trace_ELBO())
+    svi = SVI(qst.model, qst.guide, optimizer, loss=Trace_ELBO())
 
     train_elbo = []
     test_elbo = []
@@ -214,26 +233,23 @@ def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128, n_sampl
     plt.ylabel('ELBO')
     plt.legend()
     plt.title(f"Experiment: {name}, Qubits: {n_qubits}, Pure States: {n_states}")
-    plt.savefig("output/"+name+"_ELBO.png")
+    plt.savefig("output/"+name+"_ELBO.png",dpi=600)
 
-    real_part = pyro.param('AutoNormal.locs.real_part').data[0]
-    imag_part = pyro.param('AutoNormal.locs.imag_part').data[0]
- 
-    vec = torch.complex(real_part, imag_part) / torch.linalg.vector_norm(torch.complex(real_part, imag_part))
-    vec = vec.numpy().flatten()
-    approx_DM = np.outer(vec, np.conj(vec))
+    real_part = pyro.param('real_mean').data
+    imag_part = pyro.param('imag_mean').data
+    theta = pyro.param('constrained_vector').data.numpy()
+    vecs = F.normalize(torch.complex(real_part, imag_part), p=2, dim=1).numpy()
+    approx_DM = (np.conj(vecs.T) @ np.diag(theta) @ vecs)
 
     densitypath = "data/" + name + "_density"
     with open(densitypath, "rb") as file:
         rho = pickle.load(file)
-    true_DM = rho.data
+    true_DM = rho
     print(name)
-    print('Trace Distance:',trace_dist(approx_DM, true_DM).real)
-    print('Fidelity:', fidelity(approx_DM, true_DM).real)
+    print('Trace Distance:',trace_dist(approx_DM, true_DM))
+    print('Fidelity:', fidelity(approx_DM, true_DM))
     approx_prob = np.round(np.real(np.diag(approx_DM)),3)
     real_prob = np.round(np.real(np.diag(true_DM)),3)
-    #print('approx:',approx_prob)
-    #print('real:', real_prob)
     outputpath = "output/"+name+"_results.txt"
     with open(outputpath, "w") as f:
         f.write(f"name: {name}, num_qubits: {n_qubits}, num_states: {n_states}, POVM size: {povmsize}, batchsize: {batch_size}, epochs: {NUM_EPOCHS}, Learning Rate: {LEARNING_RATE} \n")
@@ -242,6 +258,10 @@ def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128, n_sampl
         f.write(f"Model Probabilities: {approx_prob}\n")
         f.write(f"True Probabilities: {real_prob}\n")
         f.write("\n")
+        f.write(f"theta: {theta}\n")
+        f.write(f"Approx Density Matrix:\n {np.round(approx_DM,3)}\n")
+        f.write(f"True Density Matrix:\n {np.round(true_DM,3)}\n")
+
 
 
 
@@ -258,5 +278,7 @@ if __name__ == "__main__":
     parser.add_argument("--name", "-n", type=str, default = "MISSING", help="Choose name of experiment")
     parser.add_argument("--batchsize", "-b", type=int, default=128, help="batch size of the training")
     parser.add_argument("--samplenum", "-s", type=int, default=10000, help="how many samples in the dataset")
+    parser.add_argument("--epochs", "-e", type=int, default=100, help="how many epochs run for")
+    parser.add_argument("--learn", "-l", type=int, default=.001, help="learning rate")
     args = parser.parse_args()
-    run_tomography_model(args.name, args.n, args.k, batch_size=args.batchsize, n_samples=args.samplenum)
+    run_tomography_model(args.name, args.n, args.k, batch_size=args.batchsize, n_samples=args.samplenum, n_epochs=args.epochs, lr=args.learn)
