@@ -279,6 +279,6 @@ if __name__ == "__main__":
     parser.add_argument("--batchsize", "-b", type=int, default=128, help="batch size of the training")
     parser.add_argument("--samplenum", "-s", type=int, default=10000, help="how many samples in the dataset")
     parser.add_argument("--epochs", "-e", type=int, default=100, help="how many epochs run for")
-    parser.add_argument("--learn", "-l", type=int, default=.001, help="learning rate")
+    parser.add_argument("--learn", "-l", type=float, default=.01, help="learning rate")
     args = parser.parse_args()
     run_tomography_model(args.name, args.n, args.k, batch_size=args.batchsize, n_samples=args.samplenum, n_epochs=args.epochs, lr=args.learn)
