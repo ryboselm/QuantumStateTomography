@@ -160,14 +160,18 @@ loads data
 """
 def load_data(path, n_samples=10000):
     probabilities = []
+    stdflag = False
     with open(path, "r") as f:
         lines = f.read().splitlines()
+    if lines[0] == "standard":
+        lines = lines[1:]
+        stdflag = True
     for line in lines:
         _, freq = line.split(" ")
         probabilities.append(float(freq))
     options = range(len(probabilities))
     data = np.random.choice(options, n_samples, p=probabilities)
-    return data
+    return data, stdflag
 
 def load_povm(path):
     with open(path, "rb") as f:
@@ -188,7 +192,11 @@ def run_tomography_model(name, n_qubits=2, n_states=1, batch_size = 128, n_sampl
 
     statspath = "data/" + name + "_statistics"
     try:
-        data = load_data(statspath, n_samples)
+        data, stdflag = load_data(statspath, n_samples)
+        if stdflag:
+            print("Using the standard basis")
+            povm = None
+            povmsize = 2**n_qubits
     except:
         print(f"An exception occurred with loading the data from {statspath}!")
         return
